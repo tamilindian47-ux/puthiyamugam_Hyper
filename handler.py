@@ -395,3 +395,20 @@ def handler(event):
                     "reference_frame": reference,
                     "reference_similarity": round(float(similarity), 4),
                     "facefusion_seconds": round(seconds, 3),
+                },
+            }
+
+    except Exception as exc:
+        traceback.print_exc()
+        return {
+            "status": "failed",
+            "error": str(exc),
+        }
+
+    finally:
+        print(f"JOB END {job_id}", flush=True)
+
+
+if __name__ == "__main__":
+    configure_assets()
+    runpod.serverless.start({"handler": handler})
