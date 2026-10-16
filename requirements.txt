@@ -1,12 +1,4 @@
 numpy==1.26.4
-opencv-python-headless==4.10.0.84
-onnxruntime-gpu==1.22.0
-insightface==0.7.3
+Pillow>=10.4,<12
 requests>=2.32,<3
 runpod>=1.7,<2
-nvidia-cuda-runtime-cu12
-nvidia-cuda-nvrtc-cu12
-nvidia-cublas-cu12
-nvidia-cufft-cu12
-nvidia-curand-cu12
-nvidia-cudnn-cu12==9.*
