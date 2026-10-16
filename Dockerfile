@@ -61,7 +61,7 @@ RUN python3 -m venv /opt/ffenv && \
         nvidia-curand-cu12 \
         'nvidia-cudnn-cu12==9.*'
 
-# BUILD-TIME PATCH: Fix GPU memory telemetry + Disable NSFW Filter + Bypass Core Hash Check
+# BUILD-TIME PATCH: Fix GPU memory telemetry + Disable Content Filter + Preserve Detector Pre-Checks
 RUN /opt/ffenv/bin/python - <<'PY'
 import ast
 from pathlib import Path
@@ -85,30 +85,33 @@ for node in tree.body:
         ]
 exec_path.write_text(ast.unparse(tree), encoding="utf-8")
 
-# 2. Patch Content Analyser (AST rewrites all checks to return False)
+# 2. Patch Content Analyser (Checks return False, pre_check returns True)
 analyser_path = ff_pkg / "content_analyser.py"
 a_src = analyser_path.read_text(encoding="utf-8")
 a_tree = ast.parse(a_src)
 for node in a_tree.body:
-    if isinstance(node, ast.FunctionDef) and node.name in (
-        "analyse_frame", "analyse_image", "analyse_video", "detect_nsfw", "analyse_stream"
-    ):
-        node.body = [ast.Return(value=ast.Constant(value=False))]
+    if isinstance(node, ast.FunctionDef):
+        if node.name in ("analyse_frame", "analyse_image", "analyse_video", "detect_nsfw", "analyse_stream"):
+            node.body = [ast.Return(value=ast.Constant(value=False))]
+        elif node.name == "pre_check":
+            node.body = [ast.Return(value=ast.Constant(value=True))]
 analyser_path.write_text(ast.unparse(a_tree), encoding="utf-8")
 
-# 3. Patch Core (common_pre_check returns True to bypass hash validation)
+# 3. Patch Core (PRESERVES module.pre_check() for face_detector, removes content_analyser_hash check)
 core_path = ff_pkg / "core.py"
 c_src = core_path.read_text(encoding="utf-8")
 c_tree = ast.parse(c_src)
 for node in c_tree.body:
     if isinstance(node, ast.FunctionDef) and node.name == "common_pre_check":
-        node.body = [ast.Return(value=ast.Constant(value=True))]
+        for child in node.body:
+            if isinstance(child, ast.Return):
+                child.value = ast.parse("all(module.pre_check() for module in common_modules)").body[0].value
 core_path.write_text(ast.unparse(c_tree), encoding="utf-8")
 
-print("SUCCESS: Build-time FaceFusion patches applied cleanly via AST!")
+print("SUCCESS: FaceFusion build patches applied successfully!")
 PY
 
-# Register dynamic linker paths for cuDNN 9
+# Dynamic linker paths for cuDNN 9
 RUN python3 - <<'PY'
 import json
 import subprocess
@@ -160,8 +163,8 @@ ENV FF_ASSETS_DIR="" \
     REFERENCE_FACE_DISTANCE=0.30 \
     ANCHOR_MATCH_THRESHOLD=0.50
 
-# Invalidate cache for handler and scanner
-ARG CACHEBUST=1
+# Ensure latest handler & scanner are copied
+ARG CACHEBUST=2
 COPY scanner.py handler.py /app/
 
 CMD ["python3", "-u", "/app/handler.py"]
