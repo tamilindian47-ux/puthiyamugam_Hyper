@@ -1,126 +1,110 @@
-import os
+"""Identity matching and bounded media downloads; no face-order assumptions."""
 import base64
-import cv2
+import ipaddress
+import os
+import socket
+import time
+from urllib.parse import urljoin, urlsplit
 import numpy as np
 import requests
-import onnxruntime as ort
-import insightface
-
-ort.preload_dlls()
-if 'CUDAExecutionProvider' not in ort.get_available_providers():
-    raise RuntimeError('CUDAExecutionProvider is unavailable.')
-
-app = insightface.app.FaceAnalysis(
-    name='buffalo_l', root='/root/.insightface',
-    allowed_modules=['detection', 'recognition'],
-    providers=[('CUDAExecutionProvider', {'cudnn_conv_algo_search': 'HEURISTIC'})],
-)
-app.prepare(ctx_id=0, det_thresh=0.35, det_size=(640, 640))
-for name, model in app.models.items():
-    active = model.session.get_providers()
-    print(f'SCANNER {name}: {active}', flush=True)
-    if 'CUDAExecutionProvider' not in active:
-        raise RuntimeError(f'Scanner {name} has no CUDA provider.')
-cv2.setNumThreads(1)
 
 
-def normalise(vector):
-    vector = np.asarray(vector, dtype=np.float32)
-    if vector.ndim != 1 or not np.isfinite(vector).all():
-        raise ValueError('Invalid embedding.')
+def normalise(value):
+    vector = np.asarray(value, dtype=np.float32)
+    if vector.ndim != 1 or vector.size != 512 or not np.isfinite(vector).all():
+        raise ValueError('Expected a finite 512-dimensional FaceFusion embedding. Scan again.')
     norm = float(np.linalg.norm(vector))
     if norm < 1e-8:
-        raise ValueError('Zero-length embedding.')
+        raise ValueError('Invalid zero embedding.')
     return vector / norm
 
 
-def download(value, path):
+def validate_url(url):
+    parsed = urlsplit(url)
+    if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError('Use an HTTP/HTTPS direct media URL without embedded credentials.')
+    allowed = [v.strip().lower() for v in os.getenv('URL_ALLOWED_HOSTS', '').split(',') if v.strip()]
+    if allowed and parsed.hostname.lower() not in allowed:
+        raise ValueError('URL host is not in URL_ALLOWED_HOSTS.')
+    addresses = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == 'https' else 80), type=socket.SOCK_STREAM)
+    if not addresses or any(not ipaddress.ip_address(item[4][0]).is_global for item in addresses):
+        raise ValueError('Private, local, or non-public media URL addresses are not allowed.')
+
+
+def download(value, destination):
     if not isinstance(value, str) or not value:
-        raise ValueError('Expected a URL or base64 media string.')
+        raise ValueError('Provide a media file or direct URL.')
+    maximum = int(os.getenv('MAX_INPUT_BYTES', str(512 * 1024 * 1024)))
     if value.startswith(('https://', 'http://')):
-        with requests.get(value, stream=True, timeout=(20, 180)) as response:
-            response.raise_for_status()
-            with open(path, 'wb') as handle:
-                for chunk in response.iter_content(1024 * 1024):
-                    if chunk:
-                        handle.write(chunk)
-    else:
-        if value.startswith('data:'):
-            value = value.split(',', 1)[1]
-        with open(path, 'wb') as handle:
-            handle.write(base64.b64decode(value))
+        session = requests.Session()
+        session.trust_env = False
+        url = value
+        started = time.monotonic()
+        try:
+            for _ in range(6):
+                validate_url(url)
+                with session.get(url, stream=True, timeout=(20, 90), allow_redirects=False) as response:
+                    if response.is_redirect or response.is_permanent_redirect:
+                        url = urljoin(url, response.headers.get('Location', ''))
+                        continue
+                    response.raise_for_status()
+                    if 'text/html' in response.headers.get('Content-Type', '').lower():
+                        raise ValueError('That link returns a webpage, not a media file.')
+                    length = response.headers.get('Content-Length')
+                    if length and int(length) > maximum:
+                        raise ValueError('Remote file exceeds MAX_INPUT_BYTES.')
+                    size = 0
+                    with open(destination, 'wb') as handle:
+                        for block in response.iter_content(1024 * 1024):
+                            if not block:
+                                continue
+                            size += len(block)
+                            if size > maximum or time.monotonic() - started > 600:
+                                raise ValueError('Media download exceeded its size or time limit.')
+                            handle.write(block)
+                    if size == 0:
+                        raise ValueError('Downloaded file is empty.')
+                    return size
+            raise ValueError('Too many media URL redirects.')
+        finally:
+            session.close()
+    if value.startswith('data:'):
+        header, value = value.split(',', 1)
+        if ';base64' not in header:
+            raise ValueError('Expected a base64 data URI.')
+    if len(value) > ((maximum + 2) // 3) * 4 + 8:
+        raise ValueError('Encoded file exceeds MAX_INPUT_BYTES.')
+    data = base64.b64decode(value, validate=True)
+    if not data or len(data) > maximum:
+        raise ValueError('Invalid file size.')
+    with open(destination, 'wb') as handle:
+        handle.write(data)
+    return len(data)
 
 
-def frames(path, video, limit):
-    if not video:
-        image = cv2.imread(path)
-        if image is None:
-            raise ValueError('Cannot decode image.')
-        yield 0, image
-        return
-    cap = cv2.VideoCapture(path)
-    try:
-        if not cap.isOpened():
-            raise ValueError('Cannot open video.')
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if total <= 0:
-            raise ValueError('Cannot determine frame count. Re-export as MP4.')
-        indices = np.unique(np.linspace(0, total - 1, min(total, limit), dtype=int))
-        for index in indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(index))
-            ok, frame = cap.read()
-            if ok:
-                yield int(index), frame
-    finally:
-        cap.release()
-
-
-def scan(path, video):
-    clusters = []
-    for _, frame in frames(path, video, 30):
-        for face in app.get(frame):
-            x1, y1, x2, y2 = face.bbox.astype(int)
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
-            if min(x2 - x1, y2 - y1) < 30:
-                continue
-            vector = face.normed_embedding
-            cluster = next((c for c in clusters if float(np.dot(
-                vector, normalise(c['sum']))) >= 0.58), None)
-            if cluster is None:
-                cluster = {'sum': np.zeros_like(vector), 'score': -1, 'crop': None}
-                clusters.append(cluster)
-            cluster['sum'] += vector
-            score = (x2 - x1) * (y2 - y1)
-            if score > cluster['score']:
-                cluster['score'] = score
-                cluster['crop'] = frame[y1:y2, x1:x2].copy()
-    result = []
-    for index, cluster in enumerate(clusters):
-        ok, buffer = cv2.imencode('.jpg', cluster['crop'])
-        if ok:
-            result.append({
-                'character_id': index,
-                'embedding': normalise(cluster['sum']).tolist(),
-                'thumbnail_base64': base64.b64encode(buffer).decode('ascii'),
-            })
-    return result
-
-
-def find_anchor(path, video, embedding):
-    threshold = float(os.environ.get('ANCHOR_MATCH_THRESHOLD', '0.50'))
-    best = None
-    for index, frame in frames(path, video, 120):
-        faces = app.get(frame)
-        if len(faces) != 1:
-            continue
-        score = float(np.dot(faces[0].normed_embedding, embedding))
-        if score >= threshold and (best is None or score > best[1]):
-            best = (index, score)
-    if best is None:
-        raise ValueError(
-            'No unambiguous reference frame found. This test worker needs '
-            'one clear frame with ONLY the selected person detectable. '
-            'It will not guess face ordering in a group frame.'
-        )
-    return best
+def match_faces(vectors, identities, threshold=0.50, margin=0.08):
+    """Match original-frame faces against ALL identities, including unassigned ones.
+    Reject ambiguous matches; never re-identify already-swapped pixels.
+    """
+    if not vectors or not identities:
+        return []
+    candidates = []
+    for face_index, vector in enumerate(vectors):
+        vector = normalise(vector)
+        scores = []
+        for identity_index, identity in enumerate(identities):
+            gallery = identity.get('gallery') or [identity['embedding']]
+            score = max(float(np.dot(vector, normalise(sample))) for sample in gallery)
+            scores.append((score, identity_index))
+        scores.sort(reverse=True)
+        score, identity_index = scores[0]
+        runner_up = scores[1][0] if len(scores) > 1 else -1.0
+        if score >= threshold and score - runner_up >= margin:
+            candidates.append((score, face_index, identity_index))
+    matches, used_faces, used_ids = [], set(), set()
+    for score, face_index, identity_index in sorted(candidates, reverse=True):
+        if face_index not in used_faces and identity_index not in used_ids:
+            matches.append((face_index, identity_index, score))
+            used_faces.add(face_index)
+            used_ids.add(identity_index)
+    return matches
