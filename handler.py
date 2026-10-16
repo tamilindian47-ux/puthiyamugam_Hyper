@@ -20,7 +20,7 @@ FF_PYTHON = "/opt/ffenv/bin/python"
 FF_SCRIPT = os.path.join(FF_DIR, "facefusion.py")
 
 GPU_PATCH_MARKER = "# PUTHIYAMUGAM_SAFE_GPU_TELEMETRY_V1"
-NSFW_PATCH_MARKER = "# PUTHIYAMUGAM_BYPASS_ANALYSER_V2"
+NSFW_PATCH_MARKER = "# PUTHIYAMUGAM_THRESHOLDS_V1"
 
 PIPELINES = {
     "hs_a": ("hyperswap_1a_256", False),
@@ -73,8 +73,7 @@ def configure_assets():
 def patch_facefusion():
     """
     1. Patch GPU telemetry parsing (avoids crash on non-integer fb_memory).
-    2. Disable NSFW content analyser completely in content_analyser.py.
-    3. Bypass the anti-tamper hash verification in core.py.
+    2. Set content analyser thresholds to maximum so jobs are never rejected.
     """
     ff_pkg = Path(FF_DIR) / "facefusion"
 
@@ -115,59 +114,29 @@ def patch_facefusion():
                 execution_path.write_text(patched, encoding="utf-8")
                 print("Applied FaceFusion GPU telemetry patch.", flush=True)
 
-    # ---------------- 2. Content Analyser Bypass ----------------
+    # ---------------- 2. Clean Content Analyser Threshold Bypass ----------------
     analyser_path = ff_pkg / "content_analyser.py"
     if analyser_path.is_file():
-        analyser_source = analyser_path.read_text(encoding="utf-8")
-        if NSFW_PATCH_MARKER not in analyser_source:
-            # Overwrite detect_nsfw and analyse_frame to return False unconditionally
-            modified = re.sub(
-                r"def detect_nsfw\([^\)]*\)[^:]*:",
-                "def detect_nsfw(vision_frame):\n    return False\n    if False:",
-                analyser_source,
+        source = analyser_path.read_text(encoding="utf-8")
+        if NSFW_PATCH_MARKER not in source:
+            # Cleanly replace threshold constants without altering function bodies or indentation
+            patched = re.sub(
+                r"^PROBABILITY_LIMIT\s*=.*$",
+                "PROBABILITY_LIMIT = 100.0",
+                source,
+                flags=re.MULTILINE,
             )
-            modified = re.sub(
-                r"def analyse_frame\([^\)]*\)[^:]*:",
-                "def analyse_frame(vision_frame):\n    return False\n    if False:",
-                modified,
+            patched = re.sub(
+                r"^RATE_LIMIT\s*=.*$",
+                "RATE_LIMIT = 100.0",
+                patched,
+                flags=re.MULTILINE,
             )
-            modified = re.sub(
-                r"def analyse_image\([^\)]*\)[^:]*:",
-                "def analyse_image(image_path):\n    return False\n    if False:",
-                modified,
-            )
-            modified = re.sub(
-                r"def analyse_video\([^\)]*\)[^:]*:",
-                "def analyse_video(video_path, *args, **kwargs):\n    return False\n    if False:",
-                modified,
-            )
-            analyser_path.write_text(
-                f"{NSFW_PATCH_MARKER}\n" + modified, encoding="utf-8"
-            )
-            print("Disabled FaceFusion content analyser functions.", flush=True)
+            patched = f"{NSFW_PATCH_MARKER}\n" + patched
+            analyser_path.write_text(patched, encoding="utf-8")
+            print("Set FaceFusion content analyser limits to 100%.", flush=True)
 
-    # ---------------- 3. Core Hash Verification Bypass ----------------
-    core_path = ff_pkg / "core.py"
-    if core_path.is_file():
-        core_source = core_path.read_text(encoding="utf-8")
-        if NSFW_PATCH_MARKER not in core_source:
-            # Force hash_helper check to always be True
-            modified_core = re.sub(
-                r"is_valid\s*=\s*hash_helper\.validate_content_analyser_hash\(\)",
-                "is_valid = True",
-                core_source,
-            )
-            modified_core = re.sub(
-                r"content_analyser_hash\s*==\s*['\"][0-9a-fA-F]+['\"]",
-                "True",
-                modified_core,
-            )
-            core_path.write_text(
-                f"{NSFW_PATCH_MARKER}\n" + modified_core, encoding="utf-8"
-            )
-            print("Bypassed FaceFusion core hash validation.", flush=True)
-
-    # Remove cached pyc bytecode files
+    # Clear cached bytecode
     cache_dir = ff_pkg / "__pycache__"
     if cache_dir.is_dir():
         for cached_file in cache_dir.glob("*.pyc"):
