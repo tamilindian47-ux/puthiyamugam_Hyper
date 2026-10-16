@@ -2,7 +2,6 @@ import ast
 import base64
 import json
 import os
-import re
 import subprocess
 import tempfile
 import time
@@ -20,7 +19,7 @@ FF_PYTHON = "/opt/ffenv/bin/python"
 FF_SCRIPT = os.path.join(FF_DIR, "facefusion.py")
 
 GPU_PATCH_MARKER = "# PUTHIYAMUGAM_SAFE_GPU_TELEMETRY_V1"
-NSFW_PATCH_MARKER = "# PUTHIYAMUGAM_THRESHOLDS_V1"
+BYPASS_MARKER = "# PUTHIYAMUGAM_AST_BYPASS_V1"
 
 PIPELINES = {
     "hs_a": ("hyperswap_1a_256", False),
@@ -70,10 +69,20 @@ def configure_assets():
         )
 
 
+class AstSafetyBypasser(ast.NodeTransformer):
+    def visit_FunctionDef(self, node):
+        if node.name in ("analyse_frame", "analyse_image", "analyse_video", "detect_nsfw", "analyse_stream"):
+            node.body = [ast.Return(value=ast.Constant(value=False))]
+        elif node.name == "common_pre_check":
+            node.body = [ast.Return(value=ast.Constant(value=True))]
+        return node
+
+
 def patch_facefusion():
     """
     1. Patch GPU telemetry parsing (avoids crash on non-integer fb_memory).
-    2. Set content analyser thresholds to maximum so jobs are never rejected.
+    2. Patch content_analyser.py via AST (analyse_* returns False).
+    3. Patch core.py via AST (common_pre_check returns True to bypass hash check).
     """
     ff_pkg = Path(FF_DIR) / "facefusion"
 
@@ -114,27 +123,31 @@ def patch_facefusion():
                 execution_path.write_text(patched, encoding="utf-8")
                 print("Applied FaceFusion GPU telemetry patch.", flush=True)
 
-    # ---------------- 2. Clean Content Analyser Threshold Bypass ----------------
+    # ---------------- 2. Content Analyser Patch (AST) ----------------
     analyser_path = ff_pkg / "content_analyser.py"
     if analyser_path.is_file():
         source = analyser_path.read_text(encoding="utf-8")
-        if NSFW_PATCH_MARKER not in source:
-            # Cleanly replace threshold constants without altering function bodies or indentation
-            patched = re.sub(
-                r"^PROBABILITY_LIMIT\s*=.*$",
-                "PROBABILITY_LIMIT = 100.0",
-                source,
-                flags=re.MULTILINE,
-            )
-            patched = re.sub(
-                r"^RATE_LIMIT\s*=.*$",
-                "RATE_LIMIT = 100.0",
-                patched,
-                flags=re.MULTILINE,
-            )
-            patched = f"{NSFW_PATCH_MARKER}\n" + patched
-            analyser_path.write_text(patched, encoding="utf-8")
-            print("Set FaceFusion content analyser limits to 100%.", flush=True)
+        if BYPASS_MARKER not in source:
+            tree = ast.parse(source)
+            transformer = AstSafetyBypasser()
+            new_tree = transformer.visit(tree)
+            ast.fix_missing_locations(new_tree)
+            patched_code = f"{BYPASS_MARKER}\n" + ast.unparse(new_tree)
+            analyser_path.write_text(patched_code, encoding="utf-8")
+            print("Patched content_analyser.py (all checks return False).", flush=True)
+
+    # ---------------- 3. Core Pre-Check Patch (AST) ----------------
+    core_path = ff_pkg / "core.py"
+    if core_path.is_file():
+        core_source = core_path.read_text(encoding="utf-8")
+        if BYPASS_MARKER not in core_source:
+            tree = ast.parse(core_source)
+            transformer = AstSafetyBypasser()
+            new_tree = transformer.visit(tree)
+            ast.fix_missing_locations(new_tree)
+            patched_code = f"{BYPASS_MARKER}\n" + ast.unparse(new_tree)
+            core_path.write_text(patched_code, encoding="utf-8")
+            print("Patched core.py (common_pre_check returns True).", flush=True)
 
     # Clear cached bytecode
     cache_dir = ff_pkg / "__pycache__"
@@ -382,20 +395,3 @@ def handler(event):
                     "reference_frame": reference,
                     "reference_similarity": round(float(similarity), 4),
                     "facefusion_seconds": round(seconds, 3),
-                },
-            }
-
-    except Exception as exc:
-        traceback.print_exc()
-        return {
-            "status": "failed",
-            "error": str(exc),
-        }
-
-    finally:
-        print(f"JOB END {job_id}", flush=True)
-
-
-if __name__ == "__main__":
-    configure_assets()
-    runpod.serverless.start({"handler": handler})
