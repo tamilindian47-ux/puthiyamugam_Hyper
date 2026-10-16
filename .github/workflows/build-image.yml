@@ -20,20 +20,20 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Define image name
+      - name: Define lowercase image name
         id: image
         shell: bash
         run: |
           REPOSITORY="${GITHUB_REPOSITORY,,}"
           echo "name=ghcr.io/${REPOSITORY}" >> "$GITHUB_OUTPUT"
 
-      - name: Reject private Runpod base image
+      - name: Reject inaccessible Runpod base image
         shell: bash
         run: |
           if grep -Eiq \
             '^[[:space:]]*FROM[[:space:]].*registry\.runpod\.net' \
             Dockerfile; then
-            echo "::error::Restore the public NVIDIA-base Dockerfile first."
+            echo "::error::Dockerfile still uses a private Runpod base image."
             exit 1
           fi
 
@@ -63,17 +63,18 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Display deployment image
+      - name: Show image address for Runpod
         shell: bash
         env:
           IMAGE: ${{ steps.image.outputs.name }}
         run: |
           {
-            echo "## Image ready"
+            echo "## PuthiyaMugam image built"
             echo
-            echo "Deploy this image on Runpod:"
+            echo "Use this exact image in Runpod:"
             echo
             echo "\`${IMAGE}:${GITHUB_SHA}\`"
             echo
-            echo "Make the package public, or configure private-registry credentials."
+            echo "The image package must be public,"
+            echo "or Runpod must have GHCR pull credentials."
           } >> "$GITHUB_STEP_SUMMARY"
