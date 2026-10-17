@@ -1,0 +1,75 @@
+name: Build PuthiyaMugam image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - requirements.txt
+      - handler.py
+      - scanner.py
+      - ff_bridge.py
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: puthiyamugam-image-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Define lowercase image name
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse stale or mixed source files
+        shell: bash
+        run: |
+          for file in handler.py scanner.py ff_bridge.py; do
+            grep -q "pm-bundle-20261017-1" "$file" || { echo "::error::$file is not from the matching bundle"; exit 1; }
+          done
+          ! grep -q "def checked_content" ff_bridge.py || { echo "::error::old ff_bridge.py"; exit 1; }
+          ! grep -Eiq '^FROM .*registry\.runpod\.net' Dockerfile || { echo "::error::private base image"; exit 1; }
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            SOURCE_SHA=${{ github.sha }}
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Show the exact image to deploy
+        shell: bash
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+        run: |
+          {
+            echo "## Deploy exactly this image on Runpod"
+            echo
+            echo "\`${IMAGE}:${GITHUB_SHA}\`"
+            echo
+            echo "After deploying, the HTML version check must show source_sha beginning with \`${GITHUB_SHA:0:7}\`."
+          } >> "$GITHUB_STEP_SUMMARY"bu
