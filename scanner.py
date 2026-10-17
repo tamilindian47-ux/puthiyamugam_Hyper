@@ -1,4 +1,4 @@
-"""Identity matching and bounded media downloads; no face-order assumptions."""
+"""Identity matching and bounded media downloads. No face-order assumptions."""
 import base64
 import ipaddress
 import os
@@ -8,11 +8,13 @@ from urllib.parse import urljoin, urlsplit
 import numpy as np
 import requests
 
+BUNDLE_ID = 'pm-bundle-20261017-1'
+
 
 def normalise(value):
     vector = np.asarray(value, dtype=np.float32)
     if vector.ndim != 1 or vector.size != 512 or not np.isfinite(vector).all():
-        raise ValueError('Expected a finite 512-dimensional FaceFusion embedding. Scan again.')
+        raise ValueError('Expected a finite 512-dimensional embedding. Scan again.')
     norm = float(np.linalg.norm(vector))
     if norm < 1e-8:
         raise ValueError('Invalid zero embedding.')
@@ -26,9 +28,10 @@ def validate_url(url):
     allowed = [v.strip().lower() for v in os.getenv('URL_ALLOWED_HOSTS', '').split(',') if v.strip()]
     if allowed and parsed.hostname.lower() not in allowed:
         raise ValueError('URL host is not in URL_ALLOWED_HOSTS.')
-    addresses = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == 'https' else 80), type=socket.SOCK_STREAM)
+    port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+    addresses = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
     if not addresses or any(not ipaddress.ip_address(item[4][0]).is_global for item in addresses):
-        raise ValueError('Private, local, or non-public media URL addresses are not allowed.')
+        raise ValueError('Private, local, or non-public URL addresses are not allowed.')
 
 
 def download(value, destination):
@@ -65,7 +68,7 @@ def download(value, destination):
                     if size == 0:
                         raise ValueError('Downloaded file is empty.')
                     return size
-            raise ValueError('Too many media URL redirects.')
+            raise ValueError('Too many redirects.')
         finally:
             session.close()
     if value.startswith('data:'):
@@ -83,9 +86,7 @@ def download(value, destination):
 
 
 def match_faces(vectors, identities, threshold=0.50, margin=0.08):
-    """Match original-frame faces against ALL identities, including unassigned ones.
-    Reject ambiguous matches; never re-identify already-swapped pixels.
-    """
+    """Match faces from the ORIGINAL frame against all scanned identities."""
     if not vectors or not identities:
         return []
     candidates = []
